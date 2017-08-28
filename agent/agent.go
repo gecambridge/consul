@@ -109,7 +109,7 @@ type Agent struct {
 
 	// state stores a local representation of the node,
 	// services and checks. Used for anti-entropy.
-	state *local.State
+	State *local.State
 
 	// sync manages the synchronization of the local
 	// and the remote state.
@@ -230,6 +230,22 @@ func New(c *config.RuntimeConfig) (*Agent, error) {
 	return a, nil
 }
 
+func LocalConfig(cfg *config.RuntimeConfig) local.Config {
+	lc := local.Config{
+		AdvertiseAddr:       cfg.AdvertiseAddrLAN.String(),
+		CheckUpdateInterval: cfg.CheckUpdateInterval,
+		Datacenter:          cfg.Datacenter,
+		DiscardCheckOutput:  cfg.DiscardCheckOutput,
+		NodeID:              cfg.NodeID,
+		NodeName:            cfg.NodeName,
+		TaggedAddresses:     map[string]string{},
+	}
+	for k, v := range cfg.TaggedAddresses {
+		lc.TaggedAddresses[k] = v
+	}
+	return lc
+}
+
 func (a *Agent) Start() error {
 	c := a.config
 
@@ -256,24 +272,12 @@ func (a *Agent) Start() error {
 	triggerCh := make(chan struct{}, 1)
 
 	// create the local state
-	lc := local.Config{
-		AdvertiseAddr:       c.AdvertiseAddrLAN.String(),
-		CheckUpdateInterval: c.CheckUpdateInterval,
-		Datacenter:          c.Datacenter,
-		DiscardCheckOutput:  c.DiscardCheckOutput,
-		NodeID:              c.NodeID,
-		NodeName:            c.NodeName,
-		TaggedAddresses:     map[string]string{},
-	}
-	for k, v := range c.TaggedAddresses {
-		lc.TaggedAddresses[k] = v
-	}
-	a.state = local.NewState(lc, a.logger, a.tokens, triggerCh)
+	a.State = local.NewState(LocalConfig(c), a.logger, a.tokens, triggerCh)
 
 	// create the state synchronization manager which performs
 	// regular and on-demand state synchronizations (anti-entropy).
 	a.sync = &ae.StateSyncer{
-		State:      a.state,
+		State:      a.State,
 		Interval:   c.AEInterval,
 		ShutdownCh: a.shutdownCh,
 		ServerUpCh: serverUpCh,
@@ -306,7 +310,7 @@ func (a *Agent) Start() error {
 		}
 
 		a.delegate = server
-		a.state.SetDelegate(server)
+		a.State.SetDelegate(server)
 		a.sync.ClusterSize = func() int { return len(server.LANMembers()) }
 	} else {
 		client, err := consul.NewClientLogger(consulCfg, a.logger)
@@ -315,7 +319,7 @@ func (a *Agent) Start() error {
 		}
 
 		a.delegate = client
-		a.state.SetDelegate(client)
+		a.State.SetDelegate(client)
 		a.sync.ClusterSize = func() int { return len(client.LANMembers()) }
 	}
 
@@ -1380,7 +1384,7 @@ OUTER:
 // reapServicesInternal does a single pass, looking for services to reap.
 func (a *Agent) reapServicesInternal() {
 	reaped := make(map[string]bool)
-	for checkID, cs := range a.state.CriticalCheckStates() {
+	for checkID, cs := range a.State.CriticalCheckStates() {
 		serviceID := cs.Check.ServiceID
 
 		// There's nothing to do if there's no service.
@@ -1438,7 +1442,7 @@ func (a *Agent) persistService(service *structs.NodeService) error {
 	svcPath := filepath.Join(a.config.DataDir, servicesDir, stringHash(service.ID))
 
 	wrapped := persistedService{
-		Token:   a.state.ServiceToken(service.ID),
+		Token:   a.State.ServiceToken(service.ID),
 		Service: service,
 	}
 	encoded, err := json.Marshal(wrapped)
@@ -1466,7 +1470,7 @@ func (a *Agent) persistCheck(check *structs.HealthCheck, chkType *structs.CheckT
 	wrapped := persistedCheck{
 		Check:   check,
 		ChkType: chkType,
-		Token:   a.state.CheckToken(check.CheckID),
+		Token:   a.State.CheckToken(check.CheckID),
 	}
 
 	encoded, err := json.Marshal(wrapped)
@@ -1565,7 +1569,7 @@ func (a *Agent) AddService(service *structs.NodeService, chkTypes []*structs.Che
 	defer a.restoreCheckState(snap)
 
 	// Add the service
-	a.state.AddService(service, token)
+	a.State.AddService(service, token)
 
 	// Persist the service to a file
 	if persist && !a.config.DevMode {
@@ -1615,7 +1619,7 @@ func (a *Agent) RemoveService(serviceID string, persist bool) error {
 	}
 
 	// Remove service immediately
-	if err := a.state.RemoveService(serviceID); err != nil {
+	if err := a.State.RemoveService(serviceID); err != nil {
 		a.logger.Printf("[WARN] agent: Failed to deregister service %q: %s", serviceID, err)
 		return nil
 	}
@@ -1628,7 +1632,7 @@ func (a *Agent) RemoveService(serviceID string, persist bool) error {
 	}
 
 	// Deregister any associated health checks
-	for checkID, check := range a.state.Checks() {
+	for checkID, check := range a.State.Checks() {
 		if check.ServiceID != serviceID {
 			continue
 		}
@@ -1661,7 +1665,7 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 	}
 
 	if check.ServiceID != "" {
-		s := a.state.Services()[check.ServiceID]
+		s := a.State.Service(check.ServiceID)
 		if s == nil {
 			return fmt.Errorf("ServiceID %q does not exist", check.ServiceID)
 		}
@@ -1682,7 +1686,7 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 			}
 
 			ttl := &CheckTTL{
-				Notify:  a.state,
+				Notify:  a.State,
 				CheckID: check.CheckID,
 				TTL:     chkType.TTL,
 				Logger:  a.logger,
@@ -1709,7 +1713,7 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 			}
 
 			http := &CheckHTTP{
-				Notify:        a.state,
+				Notify:        a.State,
 				CheckID:       check.CheckID,
 				HTTP:          chkType.HTTP,
 				Header:        chkType.Header,
@@ -1734,7 +1738,7 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 			}
 
 			tcp := &CheckTCP{
-				Notify:   a.state,
+				Notify:   a.State,
 				CheckID:  check.CheckID,
 				TCP:      chkType.TCP,
 				Interval: chkType.Interval,
@@ -1771,7 +1775,7 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 			}
 
 			dockerCheck := &CheckDocker{
-				Notify:            a.state,
+				Notify:            a.State,
 				CheckID:           check.CheckID,
 				DockerContainerID: chkType.DockerContainerID,
 				Shell:             chkType.Shell,
@@ -1801,7 +1805,7 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 			}
 
 			monitor := &CheckMonitor{
-				Notify:     a.state,
+				Notify:     a.State,
 				CheckID:    check.CheckID,
 				Script:     chkType.Script,
 				ScriptArgs: chkType.ScriptArgs,
@@ -1830,7 +1834,7 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 	}
 
 	// Add to the local state for anti-entropy
-	err := a.state.AddCheck(check, token)
+	err := a.State.AddCheck(check, token)
 	if err != nil {
 		a.cancelCheckMonitors(check.CheckID)
 		return err
@@ -1853,7 +1857,7 @@ func (a *Agent) RemoveCheck(checkID types.CheckID, persist bool) error {
 	}
 
 	// Add to the local state for anti-entropy
-	a.state.RemoveCheck(checkID)
+	a.State.RemoveCheck(checkID)
 
 	a.checkLock.Lock()
 	defer a.checkLock.Unlock()
@@ -2018,7 +2022,7 @@ func (a *Agent) Stats() map[string]map[string]string {
 		"check_monitors": strconv.Itoa(len(a.checkMonitors)),
 		"check_ttls":     strconv.Itoa(len(a.checkTTLs)),
 	}
-	for k, v := range a.state.Stats() {
+	for k, v := range a.State.Stats() {
 		stats["agent"][k] = v
 	}
 
@@ -2142,7 +2146,7 @@ func (a *Agent) loadServices(conf *config.RuntimeConfig) error {
 		}
 		serviceID := p.Service.ID
 
-		if a.state.Service(serviceID) != nil {
+		if a.State.Service(serviceID) != nil {
 			// Purge previously persisted service. This allows config to be
 			// preferred over services persisted from the API.
 			a.logger.Printf("[DEBUG] agent: service %q exists, not restoring from %q",
@@ -2165,7 +2169,7 @@ func (a *Agent) loadServices(conf *config.RuntimeConfig) error {
 // unloadServices will deregister all services other than the 'consul' service
 // known to the local agent.
 func (a *Agent) unloadServices() error {
-	for id := range a.state.Services() {
+	for id := range a.State.Services() {
 		if err := a.RemoveService(id, false); err != nil {
 			return fmt.Errorf("Failed deregistering service '%s': %v", id, err)
 		}
@@ -2221,7 +2225,7 @@ func (a *Agent) loadChecks(conf *config.RuntimeConfig) error {
 		}
 		checkID := p.Check.CheckID
 
-		if a.state.Check(checkID) != nil {
+		if a.State.Check(checkID) != nil {
 			// Purge previously persisted check. This allows config to be
 			// preferred over persisted checks from the API.
 			a.logger.Printf("[DEBUG] agent: check %q exists, not restoring from %q",
@@ -2252,7 +2256,7 @@ func (a *Agent) loadChecks(conf *config.RuntimeConfig) error {
 
 // unloadChecks will deregister all checks known to the local agent.
 func (a *Agent) unloadChecks() error {
-	for id := range a.state.Checks() {
+	for id := range a.State.Checks() {
 		if err := a.RemoveCheck(id, false); err != nil {
 			return fmt.Errorf("Failed deregistering check '%s': %s", id, err)
 		}
@@ -2264,7 +2268,7 @@ func (a *Agent) unloadChecks() error {
 // checks. This is done before we reload our checks, so that we can properly
 // restore into the same state.
 func (a *Agent) snapshotCheckState() map[types.CheckID]*structs.HealthCheck {
-	return a.state.Checks()
+	return a.State.Checks()
 }
 
 // restoreCheckState is used to reset the health state based on a snapshot.
@@ -2272,7 +2276,7 @@ func (a *Agent) snapshotCheckState() map[types.CheckID]*structs.HealthCheck {
 // in health state and potential session invalidations.
 func (a *Agent) restoreCheckState(snap map[types.CheckID]*structs.HealthCheck) {
 	for id, check := range snap {
-		a.state.UpdateCheck(id, check.Status, check.Output)
+		a.State.UpdateCheck(id, check.Status, check.Output)
 	}
 }
 
@@ -2284,12 +2288,12 @@ func (a *Agent) loadMetadata(conf *config.RuntimeConfig) error {
 		meta[k] = v
 	}
 	meta[structs.MetaSegmentKey] = conf.SegmentName
-	return a.state.LoadMetadata(meta)
+	return a.State.LoadMetadata(meta)
 }
 
 // unloadMetadata resets the local metadata state
 func (a *Agent) unloadMetadata() {
-	a.state.UnloadMetadata()
+	a.State.UnloadMetadata()
 }
 
 // serviceMaintCheckID returns the ID of a given service's maintenance check
@@ -2300,14 +2304,14 @@ func serviceMaintCheckID(serviceID string) types.CheckID {
 // EnableServiceMaintenance will register a false health check against the given
 // service ID with critical status. This will exclude the service from queries.
 func (a *Agent) EnableServiceMaintenance(serviceID, reason, token string) error {
-	service, ok := a.state.Services()[serviceID]
+	service, ok := a.State.Services()[serviceID]
 	if !ok {
 		return fmt.Errorf("No service registered with ID %q", serviceID)
 	}
 
 	// Check if maintenance mode is not already enabled
 	checkID := serviceMaintCheckID(serviceID)
-	if _, ok := a.state.Checks()[checkID]; ok {
+	if _, ok := a.State.Checks()[checkID]; ok {
 		return nil
 	}
 
@@ -2335,13 +2339,13 @@ func (a *Agent) EnableServiceMaintenance(serviceID, reason, token string) error 
 // DisableServiceMaintenance will deregister the fake maintenance mode check
 // if the service has been marked as in maintenance.
 func (a *Agent) DisableServiceMaintenance(serviceID string) error {
-	if _, ok := a.state.Services()[serviceID]; !ok {
+	if _, ok := a.State.Services()[serviceID]; !ok {
 		return fmt.Errorf("No service registered with ID %q", serviceID)
 	}
 
 	// Check if maintenance mode is enabled
 	checkID := serviceMaintCheckID(serviceID)
-	if _, ok := a.state.Checks()[checkID]; !ok {
+	if _, ok := a.State.Checks()[checkID]; !ok {
 		return nil
 	}
 
@@ -2355,7 +2359,7 @@ func (a *Agent) DisableServiceMaintenance(serviceID string) error {
 // EnableNodeMaintenance places a node into maintenance mode.
 func (a *Agent) EnableNodeMaintenance(reason, token string) {
 	// Ensure node maintenance is not already enabled
-	if _, ok := a.state.Checks()[structs.NodeMaint]; ok {
+	if _, ok := a.State.Checks()[structs.NodeMaint]; ok {
 		return
 	}
 
@@ -2378,7 +2382,7 @@ func (a *Agent) EnableNodeMaintenance(reason, token string) {
 
 // DisableNodeMaintenance removes a node from maintenance mode
 func (a *Agent) DisableNodeMaintenance() {
-	if _, ok := a.state.Checks()[structs.NodeMaint]; !ok {
+	if _, ok := a.State.Checks()[structs.NodeMaint]; !ok {
 		return
 	}
 	a.RemoveCheck(structs.NodeMaint, true)
@@ -2422,7 +2426,7 @@ func (a *Agent) ReloadConfig(newCfg *config.RuntimeConfig) error {
 	// Update filtered metrics
 	metrics.UpdateFilter(newCfg.TelemetryAllowedPrefixes, newCfg.TelemetryBlockedPrefixes)
 
-	a.state.SetDiscardCheckOutput(newCfg.DiscardCheckOutput)
+	a.State.SetDiscardCheckOutput(newCfg.DiscardCheckOutput)
 
 	return nil
 }
