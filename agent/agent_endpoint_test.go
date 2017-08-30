@@ -1181,7 +1181,7 @@ func TestAgent_RegisterService_TranslateKeys(t *testing.T) {
 		EnableTagOverride: true,
 	}
 
-	if got, want := a.state.Services()["test"], svc; !verify.Values(t, "", got, want) {
+	if got, want := a.State.Service("test"), svc; !verify.Values(t, "", got, want) {
 		t.Fail()
 	}
 }
